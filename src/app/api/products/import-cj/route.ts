@@ -1,128 +1,141 @@
-// app/api/products/import-cj/route.ts
-import { NextResponse } from 'next/server';
+// src/app/api/products/import-cj/route.ts
+import { NextRequest, NextResponse } from 'next/server';
 
-/**
- * Extrai o ID único do CJ (UUIDv4 ou numérico) de forma resiliente a partir de links estruturados de SEO.
- */
-function extractCJProductId(input: string): string | null {
-  if (!input) return null;
-  const trimmed = input.trim();
+// Cache em memória local do Token de Importação
+let importToken: string | null = null;
+let importTokenExpiry: number | null = null;
 
-  const uuidRegex = /^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/;
-  const numericIdRegex = /^\d{10,25}$/;
-
-  // 1. Entrada direta
-  if (uuidRegex.test(trimmed) || numericIdRegex.test(trimmed)) {
-    return trimmed;
+async function getCJImportToken(): Promise<string> {
+  const apiKey = process.env.CJ_API_KEY;
+  if (!apiKey) {
+    throw new Error('A variável de ambiente CJ_API_KEY não foi configurada.');
   }
 
-  // 2. Análise por API de URL
-  try {
-    const url = new URL(trimmed);
-    const idParam = url.searchParams.get('id') || url.searchParams.get('pid');
-    if (idParam) {
-      const cleanedId = idParam.trim();
-      if (uuidRegex.test(cleanedId) || numericIdRegex.test(cleanedId) || /^[a-zA-Z0-9-]+$/.test(cleanedId)) {
-        return cleanedId;
-      }
-    }
+  if (importToken && importTokenExpiry && Date.now() < importTokenExpiry) {
+    return importToken;
+  }
 
-    const pathname = url.pathname;
-    const pathMatch = pathname.match(/-p-([a-zA-Z0-9-]+)\.html/i);
-    if (pathMatch && pathMatch[1]) {
-      return pathMatch[1].trim();
-    }
-  } catch (error) {}
+  const response = await fetch('https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey }),
+  });
 
-  // 3. Fallbacks de Regex
-  const uuidMatch = trimmed.match(/[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}/i);
+  const resData = await response.json();
+  if (resData.result && resData.data?.accessToken) {
+    importToken = resData.data.accessToken;
+    importTokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
+    return importToken;
+  }
+
+  throw new Error(resData.message || 'Autenticação rejeitada pela CJ Dropshipping.');
+}
+
+/**
+ * Extração resiliente de IDs numéricos clássicos ou UUIDv4 das URLs da CJ Dropshipping.
+ */
+function extractProductId(url: string): string | null {
+  // Padrão amigável de SEO: "...-p-[ID].html"
+  const seoMatch = url.match(/-p-([a-zA-Z0-9-]+)(?:\.html)?/);
+  if (seoMatch) return seoMatch[1];
+
+  // Caso seja inserido apenas o UUID diretamente
+  const uuidMatch = url.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
   if (uuidMatch) return uuidMatch[0];
 
-  const pHtmlMatch = trimmed.match(/-p-([a-zA-Z0-9-]+)\.html/i);
-  if (pHtmlMatch && pHtmlMatch[1]) return pHtmlMatch[1];
-
-  const idQueryMatch = trimmed.match(/[?&](?:id|pid)=([a-zA-Z0-9-]+)/i);
-  if (idQueryMatch && idQueryMatch[1]) return idQueryMatch[1];
-
-  const numericMatch = trimmed.match(/\b\d{15,25}\b/);
-  if (numericMatch) return numericMatch[0];
+  // Fallback para IDs numéricos sequenciais puros
+  const idMatch = url.match(/^[a-zA-Z0-9-]+$/);
+  if (idMatch) return url;
 
   return null;
 }
 
-export async function POST(req: Request) {
+export async function POST(request: NextRequest) {
   try {
-    const { cjProductId } = await req.json();
+    const body = await request.json();
+    const { url } = body;
 
-    if (!cjProductId) {
-      return NextResponse.json({ error: 'Nenhum link fornecido.' }, { status: 400 });
+    if (!url) {
+      return NextResponse.json({ success: false, error: 'A URL do produto é obrigatória.' }, { status: 400 });
     }
 
-    const apiKey = process.env.CJ_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ error: 'CJ_API_KEY não configurada no ambiente.' }, { status: 500 });
-    }
-
-    // 1. Extração robusta do identificador único (UUID ou numérico)
-    const exactIdentifier = extractCJProductId(cjProductId);
-    if (!exactIdentifier) {
-      return NextResponse.json({ error: 'Não foi possível extrair o ID do link fornecido.' }, { status: 400 });
-    }
-
-    // 2. Autenticação na API do CJ
-    const authRes = await fetch('https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey })
-    });
-
-    const authData = await authRes.json();
-    if (authData.code !== 200 || !authData.data) {
-      return NextResponse.json({ error: 'Falha na Autenticação CJ.' }, { status: 401 });
-    }
-
-    const accessToken = authData.data.accessToken || authData.data;
-
-    // 3. Consulta de detalhes do produto
-    const detailsUrl = `https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=${exactIdentifier}`;
-    const detailsRes = await fetch(detailsUrl, {
-      method: 'GET',
-      headers: { 
-        'Content-Type': 'application/json',
-        'CJ-Access-Token': accessToken 
-      }
-    });
-
-    const cjData = await detailsRes.json();
-    if (cjData.code !== 200 || !cjData.data) {
+    const productId = extractProductId(url);
+    if (!productId) {
       return NextResponse.json({ 
-        error: `O CJ recusou a requisição: ${cjData.message || 'ID não localizado'}` 
+        success: false, 
+        error: 'Não foi possível detectar um ID válido na URL fornecida. Verifique o link e tente novamente.' 
+      }, { status: 400 });
+    }
+
+    const token = await getCJImportToken();
+
+    // Chamada à API de detalhes da CJ
+    const queryUrl = `https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=${productId}`;
+    const response = await fetch(queryUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'CJ-Access-Token': token,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Falha na resposta do servidor externo (Status: ${response.status})`);
+    }
+
+    const resData = await response.json();
+    if (!resData.result || !resData.data) {
+      return NextResponse.json({ 
+        success: false, 
+        error: resData.message || 'Produto não encontrado ou indisponível na CJ Dropshipping.' 
       }, { status: 404 });
     }
 
-    const productInfo = cjData.data;
+    const productData = resData.data;
 
-    // 4. Tratamento dos dados para auto-fill (Dólar -> Real com margem)
-    const rawCost = parseFloat(productInfo.productPrice) || parseFloat(productInfo.sellPrice) || 0;
-    const costInBRL = rawCost * 5.5; 
-    const suggestedPrice = costInBRL * 2.5; 
+    // Resiliência no mapeamento de imagens
+    let imageUrls: string[] = [];
+    if (Array.isArray(productData.productImages)) {
+      imageUrls = productData.productImages;
+    } else if (typeof productData.productImage === 'string') {
+      imageUrls = productData.productImage.split(',').map((img: string) => img.trim());
+    }
+    imageUrls = imageUrls.filter(Boolean);
+
+    // Precificação com Inteligência de Margem e CRO (Foco em conversão psicológica)
+    const rawCostPrice = parseFloat(productData.sellPrice || '0');
+    const rawSuggestPrice = parseFloat(productData.suggestSellPrice || '0');
+
+    const costPrice = rawCostPrice > 0 ? rawCostPrice : 15.0; // Fallback se zerado
+    
+    // Algoritmo de Markup: Garante margem operacional mínima de 2.5x se a recomendada for baixa
+    let suggestedPrice = rawSuggestPrice > costPrice ? rawSuggestPrice : costPrice * 2.5;
+
+    // Arredondamento estratégico de alta conversão para o mercado premium (terminados em .90 ou .97)
+    suggestedPrice = Math.ceil(suggestedPrice) - 0.10; // Ex: R$ 89,90
+
+    // Criação do payload estruturado respeitando os campos obrigatórios e restrições do banco
+    const autoFillPayload = {
+      title: productData.productNameEn || productData.productName || 'Produto Importado da CJ',
+      description: productData.productHtmlDescription || productData.description || 'Nenhuma descrição detalhada disponível.',
+      costPrice: costPrice,
+      price: suggestedPrice,
+      comparePrice: suggestedPrice * 1.6, // Preço riscado com 60% de ancoragem visual
+      images: imageUrls.map(urlStr => ({ url: urlStr })), // Envia apenas url de acordo com a regra de ouro
+      supplierUrl: url,
+      cjProductId: productData.pid || productId,
+    };
 
     return NextResponse.json({ 
       success: true, 
-      product: {
-        title: productInfo.productNameEn || '',
-        description: productInfo.description || '',
-        costPrice: costInBRL,
-        price: suggestedPrice,
-        category: productInfo.categoryName || 'Geral',
-        stock: parseInt(productInfo.sellInventory) || 100,
-        imageUrl: productInfo.productImageSet?.[0] || '', 
-        supplierUrl: exactIdentifier // ID usado no webhook/fulfillment subsequente
-      }
-    }, { status: 200 });
+      data: autoFillPayload 
+    });
 
   } catch (error: any) {
-    console.error('[CJ_IMPORT_ERROR]', error);
-    return NextResponse.json({ error: 'Falha interna ao processar a importação.' }, { status: 500 });
+    console.error('[CJ Import Error]:', error);
+    return NextResponse.json({ 
+      success: false, 
+      error: 'Ocorreu um erro interno ao processar a importação deste item.' 
+    }, { status: 500 });
   }
 }

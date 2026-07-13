@@ -3,79 +3,170 @@ import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
-export async function processCJOrder(order: any) {
-  console.log(`[FULFILLMENT] Iniciando compra automática no CJ Dropshipping - Pedido: ${order.id}`);
+// Cache em memória para evitar chamadas excessivas de autenticação no ciclo serverless (warm start)
+let cachedToken: string | null = null;
+let cachedTokenExpiry: number | null = null;
 
+/**
+ * Obtém o token de acesso da CJ Dropshipping com tratamento de cache.
+ */
+async function getCJAccessToken(): Promise<string> {
   const apiKey = process.env.CJ_API_KEY;
   if (!apiKey) {
-    throw new Error('CJ_API_KEY não configurada no .env.local');
+    throw new Error('A variável de ambiente CJ_API_KEY não foi configurada.');
   }
 
-  // Se o pedido não tiver itens populados, busca-os de forma segura para o loop
-  const orderItems = order.items || await prisma.orderItem.findMany({ where: { orderId: order.id } });
-
-  for (const item of orderItems) {
-    const product = await prisma.product.findUnique({ where: { id: item.productId } });
-
-    if (!product || !product.supplierUrl) {
-      console.warn(`[AVISO] Produto ${item.productId} sem mapeamento de fornecedor.`);
-      continue;
-    }
-
-    // Parser inteligente e resiliente do TrendRush (Extrai dados de shippingAddress unificado)
-    const addressText = order.shippingAddress || "";
-    
-    // Captura o CEP usando expressão regular (regex)
-    const cepMatch = addressText.match(/CEP:\s*([\d\-\s]+)/i);
-    const zipCode = cepMatch ? cepMatch[1].replace(/\D/g, "").trim() : "91260000"; // Fallback de segurança
-    
-    // Remove o bloco do CEP do texto final para enviar um endereço limpo ao CJ
-    const cleanAddress = addressText.split(" - CEP:")[0] || addressText;
-
-    // Estrutura de Payload adaptada e blindada contra quebras estruturais
-    const cjPayload = {
-      orderNumber: order.id,
-      shippingZip: zipCode,
-      shippingCountry: "BR",
-      shippingProvince: "RS", // Ajustável conforme regras de negócio ou província padrão
-      shippingCity: "Cidade do Cliente", 
-      shippingAddress: cleanAddress,
-      shippingCustomerName: order.customerName,
-      shippingPhone: order.customerPhone || "12312312", 
-      products: [
-        {
-          vid: product.supplierUrl, // ID do produto ou variante no CJ
-          quantity: item.quantity
-        }
-      ]
-    };
-
-    try {
-      // Disparo da requisição para a API oficial do CJDropshipping
-      const response = await fetch('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrder', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'CJ-Access-Token': apiKey
-        },
-        body: JSON.stringify(cjPayload)
-      });
-
-      const data = await response.json();
-
-      if (data.code === 200) {
-        console.log(`✅ [SUCESSO] Pedido do produto ${product.title} enviado ao CJ! ID CJ: ${data.data}`);
-      } else {
-        console.error(`❌ [ERRO API CJ] Falha ao processar pedido ${order.id}:`, data.message);
-      }
-
-    } catch (error) {
-      console.error(`❌ [ERRO DE REDE] Falha de comunicação com CJ para o produto ${product.title}`, error);
-    }
+  if (cachedToken && cachedTokenExpiry && Date.now() < cachedTokenExpiry) {
+    return cachedToken;
   }
+
+  const response = await fetch('https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey }),
+  });
+
+  const resData = await response.json();
+  if (resData.result && resData.data?.accessToken) {
+    cachedToken = resData.data.accessToken;
+    // O token expira em 180 dias, mas renovamos a cada 23 horas para manter a integridade
+    cachedTokenExpiry = Date.now() + 23 * 60 * 60 * 1000;
+    return cachedToken;
+  }
+
+  throw new Error(resData.message || 'Falha ao autenticar na API da CJ Dropshipping.');
 }
 
-// Export alternativo para garantir compatibilidade caso outros módulos usem o nome padrão
-export async function fulfillOrder(order: any) {
-  return processCJOrder(order);
+/**
+ * Analisador resiliente de endereços brasileiros.
+ * Como o banco SQLite armazena apenas "shippingAddress" (string completa), 
+ * este parser extrai os campos estruturados exigidos pela API de logística da CJ.
+ */
+export function parseBrazilianAddress(addressString: string) {
+  const cleanAddress = addressString.replace(/\s+/g, ' ').trim();
+
+  // Busca de CEP (formato XXXXX-XXX ou XXXXXXXX)
+  const cepMatch = cleanAddress.match(/(\d{5}-\d{3})|(\d{8})/);
+  const zip = cepMatch ? cepMatch[0] : '01001-000'; // Fallback padrão Sé/SP se ausente
+
+  // Busca do Estado (UF): Busca duas letras maiúsculas isoladas ou precedidas de hífen/barra
+  const stateMatch = cleanAddress.match(/(?:-\s*|\/\s*|\s+)([A-Z]{2})(?:\s+|$)/i);
+  const state = stateMatch ? stateMatch[1].toUpperCase() : 'SP';
+
+  // Tentativa de isolar a Cidade com base em separadores comuns
+  let city = 'São Paulo';
+  const parts = cleanAddress.split(/[\-\/]/).map(p => p.trim());
+  if (parts.length >= 2) {
+    const possibleCity = parts[parts.length - 2];
+    if (possibleCity && !possibleCity.match(/^\d/)) {
+      city = possibleCity;
+    }
+  }
+
+  // Divisão entre Rua e Número (procurando padrão ", [número]")
+  let street = cleanAddress;
+  let number = 'S/N';
+  const streetNumberMatch = cleanAddress.match(/([^,]+),\s*(\d+|S\/N|s\/n)/i);
+  if (streetNumberMatch) {
+    street = streetNumberMatch[1].trim();
+    number = streetNumberMatch[2].trim();
+  }
+
+  return { street, number, city, state, zip };
+}
+
+/**
+ * Processa o fulfillment automático de um pedido pago no TrendRush enviando para a CJ Dropshipping.
+ */
+export async function fulfillOrder(orderId: string) {
+  try {
+    // Busca o pedido respeitando as propriedades permitidas do SQLite
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        items: {
+          include: {
+            product: true,
+          },
+        },
+      },
+    });
+
+    if (!order) {
+      throw new Error(`Pedido ${orderId} não localizado no banco.`);
+    }
+
+    if (order.status !== 'PAID') {
+      console.warn(`[CJ Fulfillment] Abortado: O pedido ${orderId} está com status: ${order.status}`);
+      return { success: false, reason: 'Pedido não está elegível para envio (não pago).' };
+    }
+
+    const token = await getCJAccessToken();
+    const parsedAddress = parseBrazilianAddress(order.shippingAddress);
+
+    // Mapeamento dinâmico dos itens respeitando a ausência do campo SKU no modelo Product do SQLite
+    const productsToFulfill = order.items.map((item: any) => {
+      // Usamos uma propriedade dinâmica no SQLite ou ID interno do produto como fallback
+      const cjVid = item.product.cjProductId || item.product.id;
+      return {
+        vid: cjVid,
+        quantity: item.quantity || 1,
+        storeLineItemId: item.id,
+      };
+    });
+
+    if (productsToFulfill.length === 0) {
+      throw new Error('Nenhum item válido encontrado para processamento.');
+    }
+
+    const payload = {
+      orderNumber: `TrendRush-${order.id}`,
+      shippingZip: parsedAddress.zip,
+      shippingCountry: 'Brazil',
+      shippingCountryCode: 'BR',
+      shippingProvince: parsedAddress.state,
+      shippingCity: parsedAddress.city,
+      shippingCustomerName: order.customerName || 'Cliente TrendRush',
+      shippingPhone: order.customerPhone || '11999999999',
+      shippingAddress: `${parsedAddress.street}, ${parsedAddress.number}`,
+      products: productsToFulfill,
+      platform: 'trendrush',
+      orderFlow: 1, // Fluxo manual baseado em IDs da CJ
+    };
+
+    console.log(`[CJ Fulfillment] Iniciando sincronização do pedido ${orderId}...`);
+
+    const response = await fetch('https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV2', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'CJ-Access-Token': token,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const resData = await response.json();
+
+    if (!response.ok || !resData.result) {
+      console.error('[CJ Fulfillment] Retorno de erro da CJ:', resData);
+      throw new Error(resData.message || 'Falha na resposta da plataforma parceira.');
+    }
+
+    const cjOrderId = resData.data?.orderId || resData.data?.cjOrderId || null;
+
+    // Atualiza o status do pedido de forma limpa
+    await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        status: 'FULFILLED',
+      },
+    });
+
+    console.log(`[CJ Fulfillment] Sincronização concluída. ID CJ: ${cjOrderId}`);
+    return { success: true, cjOrderId };
+
+  } catch (error: any) {
+    console.error(`[CJ Fulfillment Error] Pedido ${orderId}:`, error.message);
+    return { success: false, error: error.message };
+  }
 }
