@@ -1,4 +1,3 @@
-// src/utils/cjFulfillment.ts
 import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
@@ -43,6 +42,9 @@ async function getCJAccessToken(): Promise<string> {
  * este parser extrai os campos estruturados exigidos pela API de logística da CJ.
  */
 export function parseBrazilianAddress(addressString: string) {
+  // Verificação de segurança caso o endereço venha nulo/undefined
+  if (!addressString) return { street: 'Endereço não fornecido', number: 'S/N', city: 'São Paulo', state: 'SP', zip: '01001-000' };
+
   const cleanAddress = addressString.replace(/\s+/g, ' ').trim();
 
   // Busca de CEP (formato XXXXX-XXX ou XXXXXXXX)
@@ -102,12 +104,12 @@ export async function fulfillOrder(orderId: string) {
     }
 
     const token = await getCJAccessToken();
-    const parsedAddress = parseBrazilianAddress(order.shippingAddress);
+    const parsedAddress = parseBrazilianAddress(order.shippingAddress || '');
 
     // Mapeamento dinâmico dos itens respeitando a ausência do campo SKU no modelo Product do SQLite
     const productsToFulfill = order.items.map((item: any) => {
-      // Usamos uma propriedade dinâmica no SQLite ou ID interno do produto como fallback
-      const cjVid = item.product.cjProductId || item.product.id;
+      // REGRA DE OURO: O banco usa 'supplierUrl' para o ID do fornecedor, não 'cjProductId'
+      const cjVid = item.product.supplierUrl || item.product.id;
       return {
         vid: cjVid,
         quantity: item.quantity || 1,
@@ -119,6 +121,10 @@ export async function fulfillOrder(orderId: string) {
       throw new Error('Nenhum item válido encontrado para processamento.');
     }
 
+    // Tratamento seguro para campos de cliente que podem estar ausentes no banco
+    const customerName = (order as any).customerName || 'Cliente TrendRush';
+    const customerPhone = (order as any).customerPhone || '5511999999999';
+
     const payload = {
       orderNumber: `TrendRush-${order.id}`,
       shippingZip: parsedAddress.zip,
@@ -126,8 +132,8 @@ export async function fulfillOrder(orderId: string) {
       shippingCountryCode: 'BR',
       shippingProvince: parsedAddress.state,
       shippingCity: parsedAddress.city,
-      shippingCustomerName: order.customerName || 'Cliente TrendRush',
-      shippingPhone: order.customerPhone || '11999999999',
+      shippingCustomerName: customerName,
+      shippingPhone: customerPhone,
       shippingAddress: `${parsedAddress.street}, ${parsedAddress.number}`,
       products: productsToFulfill,
       platform: 'trendrush',
