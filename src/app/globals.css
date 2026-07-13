@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-brand-dark text-white font-sans antialiased selection:bg-brand-cyan selection:text-black scroll-smooth;
+    background-image: 
+      radial-gradient(circle at 10% 20%, rgba(0, 242, 234, 0.05) 0%, transparent 40%),
+      radial-gradient(circle at 90% 80%, rgba(FF, 0, 80, 0.05) 0%, transparent 40%);
+    background-attachment: fixed;
+  }
+}
+
+/* Glassmorphism Efeito Startup de Milhões */
+.glass-morphism {
+  background: rgba(10, 10, 12, 0.75);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Neon Glow Premium */
+.neon-glow {
+  box-shadow: 0 0 15px rgba(0, 242, 234, 0.15);
+}
+
+.neon-glow-pink {
+  box-shadow: 0 0 15px rgba(255, 0, 80, 0.2);
+}
+
+/* Scrollbar minimalista e escura */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #050507;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #FF0050;
+}
