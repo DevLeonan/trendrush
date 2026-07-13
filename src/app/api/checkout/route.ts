@@ -5,7 +5,6 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 
 interface CartItem {
-interface CartItem {
   productId?: string;
   id?: string;
   quantity?: number;
