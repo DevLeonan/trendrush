@@ -15,9 +15,12 @@ export async function PUT(req: Request, { params }: { params: { id: string } }) 
 
     const id = params.id;
     const body = await req.json();
-    const { title, description, price, comparePrice, costPrice, category, stock, images, supplierUrl } = body;
+    
+    // 💡 SOLUÇÃO: Removemos o 'category' da desestruturação para não dar conflito com o schema
+    const { title, description, price, comparePrice, costPrice, stock, images, supplierUrl } = body;
 
-    if (!title || !description || price === undefined || costPrice === undefined || !category || stock === undefined) {
+    // 💡 SOLUÇÃO: Retiramos o 'category' da validação de campos obrigatórios
+    if (!title || !description || price === undefined || costPrice === undefined || stock === undefined) {
       return NextResponse.json({ error: 'Campos obrigatórios ausentes.' }, { status: 400 });
     }
 
@@ -35,7 +38,7 @@ export async function PUT(req: Request, { params }: { params: { id: string } }) 
         price,
         costPrice,
         comparePrice: comparePrice || null,
-        category,
+        // 💡 SOLUÇÃO: A linha 'category,' foi removida daqui!
         stock,
         supplierUrl: supplierUrl || null,
         images: {
